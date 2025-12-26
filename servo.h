@@ -1,0 +1,3 @@
+#define SERVO_PIN 2
+#define MIDDLE_ANGLE 90
+#define DISTANCE 30
