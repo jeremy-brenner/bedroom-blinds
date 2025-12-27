@@ -6,9 +6,16 @@
 #include <AceTime.h>
 #include <AceTimeClock.h>
 
+#include <ArduinoJson.h>
+#include <uri/UriBraces.h>
+#include <uri/UriRegex.h>
+#include <LittleFS.h>
+
 #include "wifi.h"
 #include "schedule.h"
 #include "servo.h"
+#include "deployment.h"
+
 
 using namespace ace_time;
 using namespace ace_time::clock;
@@ -20,6 +27,12 @@ static NtpClock ntpClock;
 
 ESP8266WebServer server(80);
 Servo servo;
+
+static bool fsOK;
+
+
+FS* fileSystem = &LittleFS;
+LittleFSConfig fileSystemConfig = LittleFSConfig();
 
 bool haveWifi;
 
@@ -43,6 +56,18 @@ void setup() {
     return;
   }
 
+
+  fileSystemConfig.setAutoFormat(false);
+  fileSystem->setConfig(fileSystemConfig);
+
+  fsOK = fileSystem->begin();
+  Serial.println(fsOK ? F("Filesystem initialized.") : F("Filesystem init failed!"));
+  if(!fsOK) {
+    stop();
+  }
+  
+  doFS();
+  
   server.on("/api/open", []() {
     doOpen();
     sendOk();
@@ -51,7 +76,19 @@ void setup() {
     doClose();
     sendOk();
   });
+  server.on("/api/fs", []() {
+    doFS();
+    sendOk();
+  });
 
+  server.on("/", HTTP_POST, []() {
+    server.send(200, "text/plain", "Upload handled"); // Send a basic response
+  }, handleFileUpload); 
+
+  server.on(UriRegex("/.*"), HTTP_DELETE, handleDelete);
+
+
+  server.on(UriRegex("/.*"), HTTP_GET, handleGet);
   server.onNotFound(sendNotFound);
   server.begin();
 }
@@ -70,9 +107,42 @@ void loop() {
     doOpen();
     lastOpenDay = zdt.day();
   }
-
   server.handleClient();
   delay(2000);
+}
+
+void doFS() {
+  Serial.println("Start doFS");
+  FSInfo fs_info;
+  fileSystem->info(fs_info);
+  Serial.print("Total bytes ");
+  Serial.println(fs_info.totalBytes);
+  Serial.print("Used bytes ");
+  Serial.println(fs_info.usedBytes);
+
+  listDir("/",0);
+  Serial.println("End doFS");
+}
+
+void listDir(String path, int indent) {
+  Dir dir = fileSystem->openDir(path);
+  while (dir.next()) {
+    char fileType;
+    Serial.printf("%*s", indent, "");
+    
+    if(dir.isDirectory()) {
+      fileType = 'D';
+    }
+    if(dir.isFile()) {
+      fileType = 'F';
+    }   
+    
+    Serial.printf("%c - %s %u\n", fileType, dir.fileName().c_str(), dir.fileSize());
+
+    if(dir.isDirectory()) {
+      listDir(dir.fileName(),indent+2);
+    }
+  }
 }
 
 void doOpen() {
@@ -134,3 +204,80 @@ void sendOk() {
 }
 
 
+void handleGet() { 
+  handleFileRead(server.uri());
+}
+
+void handleFileRead(String path) {
+  Serial.println("Trying to serve");
+  path = deploymentFilename(path);
+  Serial.println(path);
+  if (path.endsWith("/")) {
+    path += "index.html";
+  }
+
+  String contentType = mime::getContentType(path);
+
+  if (!fileSystem->exists(path)) {
+    // File not found, try gzip version
+    path = path + ".gz";
+  }
+  if (fileSystem->exists(path)) {
+    Serial.println("exists");
+    File file = fileSystem->open(path, "r");
+    if (server.streamFile(file, contentType) != file.size()) { Serial.println("Sent less data than expected!"); }
+    file.close();
+  } else {
+    Serial.println("no exists");
+  }
+}
+
+void handleDelete() { 
+  handleFileDelete(server.uri());
+}
+
+void handleFileDelete(String path) {
+  Serial.println("Trying to delete");
+  if (fileSystem->exists(path)) {
+    if(fileSystem->remove(path)) {
+      sendOk();
+    }else{
+      sendBadRequest();
+    }
+  } else {
+    Serial.println("no exists");
+  }
+}
+
+String deploymentFilename(String filename) {
+  return filename.startsWith("/") ? String(DEPLOYMENT_DIR) + filename : String(DEPLOYMENT_DIR )+ String('/') + filename;
+}
+
+File uploadFile;
+
+void handleFileUpload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    String filename = deploymentFilename(upload.filename);
+    Serial.print("Handle File Upload: ");
+    Serial.println(filename);
+     uploadFile = fileSystem->open(filename, "w"); 
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) {
+      uploadFile.write(upload.buf, upload.currentSize);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) {
+      uploadFile.close();
+      Serial.println("File size: " + String(upload.totalSize));
+      server.send(200, "text/plain", "File successfully uploaded");
+    } else {
+      server.send(500, "text/plain", "Failed to create file");
+    }
+  }
+}
+
+void stop() {
+  Serial.println("STOPPING!");
+  while(1);
+}
