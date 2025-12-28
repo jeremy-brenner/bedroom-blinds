@@ -80,16 +80,21 @@ function timeFormat(scheduleTime) {
 
   .wrapper > div {
     display: grid;
-    grid-template-columns: 30% 60% 10%;
+    grid-template-columns: 35% 50% 15%;
     justify-content: center; 
     align-items: center;     
-    height: 6vh;           
+    height: 6vh; 
+    padding-left: 5px;
+    padding-right: 5px;
   }
 
-  .wrapper > div > span {
-    padding: 3px;
+  .wrapper > div > span > input {
+    display: block; 
+    width: 100%;    
+    box-sizing: border-box; 
+    min-width: 0; 
   }
-  
+
   .wrapper > div > span > .icon {
     fill: #ff0000;
   }
