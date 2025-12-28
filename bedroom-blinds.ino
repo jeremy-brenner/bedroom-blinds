@@ -16,9 +16,10 @@
 #include "servo.h"
 #include "deployment.h"
 
-
 using namespace ace_time;
 using namespace ace_time::clock;
+
+using ace_time::DateStrings;
 using ace_time::clock::NtpClock;
 using ace_time::zonedbx2025::kZoneAmerica_Chicago;
 
@@ -29,18 +30,16 @@ ESP8266WebServer server(80);
 Servo servo;
 
 static bool fsOK;
-
+bool haveWifi;
+DynamicJsonDocument schedule(200);
 
 FS* fileSystem = &LittleFS;
 LittleFSConfig fileSystemConfig = LittleFSConfig();
 
-bool haveWifi;
-
-#define OPEN_ANGLE MIDDLE_ANGLE+DISTANCE
-#define CLOSE_ANGLE MIDDLE_ANGLE-DISTANCE
-
 int lastOpenDay=0;
 int lastCloseDay=0;
+
+String scheduleFile = String(DEPLOYMENT_DIR) + String("/schedule.json");
 
 void setup() {
   Serial.begin(115200);
@@ -56,7 +55,6 @@ void setup() {
     return;
   }
 
-
   fileSystemConfig.setAutoFormat(false);
   fileSystem->setConfig(fileSystemConfig);
 
@@ -66,22 +64,29 @@ void setup() {
     stop();
   }
   
-  doFS();
-  
+  ensureSchedule(scheduleFile);
+  readSchedule();
+
   server.on("/api/open", []() {
     doOpen();
     sendOk();
   });
+
   server.on("/api/close", []() {
     doClose();
     sendOk();
   });
-  server.on("/api/fs", []() {
-    doFS();
+
+  server.on("/api/readSchedule", []() {
+    readSchedule();
     sendOk();
   });
 
-  server.on("/", HTTP_POST, []() {
+  server.on("/api/ls", []() {
+    server.send(200, "text/plain", doLS());
+  });
+
+  server.on(UriRegex("/.*"), HTTP_POST, []() {
     server.send(200, "text/plain", "Upload handled"); // Send a basic response
   }, handleFileUpload); 
 
@@ -93,54 +98,94 @@ void setup() {
   server.begin();
 }
 
+int getScheduleTime(String direction, String day) {
+  return schedule[direction][day].isNull() ? schedule[direction]["Default"] : schedule[direction][day];
+}
+
 void loop() {
   acetime_t nowSeconds = ntpClock.getNow();
 
   TimeZone tz = TimeZone::forZoneInfo(&kZoneAmerica_Chicago, &chicagoProcessor);
   ZonedDateTime zdt = ZonedDateTime::forEpochSeconds(nowSeconds, tz);
-
-  if( zdt.hour() == CLOSE_HOUR && zdt.day() != lastCloseDay ) {
-    doClose();
-    lastCloseDay = zdt.day();
+  if(zdt.isError()) {
+    Serial.println("Got zdt error");
+    delay(200);
+    return;
   }
-  if( zdt.hour() == OPEN_HOUR && zdt.day() != lastOpenDay ) {
+
+  String today = DateStrings().dayOfWeekShortString(zdt.dayOfWeek());
+
+  int openTime = getScheduleTime("open", today);
+  int openHour = openTime/100;
+  int openMinute = openTime%100;
+
+  if( zdt.hour() == openHour && zdt.minute() == openMinute && zdt.day() != lastOpenDay ) {
     doOpen();
     lastOpenDay = zdt.day();
   }
+
+  int closeTime = getScheduleTime("close", today);
+  int closeHour = closeTime/100;
+  int closeMinute = closeTime%100;
+
+  if( zdt.hour() == closeHour && zdt.minute() == closeMinute && zdt.day() != lastCloseDay ) {
+    doClose();
+    lastCloseDay = zdt.day();
+  }
   server.handleClient();
-  delay(2000);
+  delay(100);
 }
 
-void doFS() {
-  Serial.println("Start doFS");
+
+
+String doLS() {
+  DynamicJsonDocument doc(2048);
   FSInfo fs_info;
   fileSystem->info(fs_info);
-  Serial.print("Total bytes ");
-  Serial.println(fs_info.totalBytes);
-  Serial.print("Used bytes ");
-  Serial.println(fs_info.usedBytes);
 
-  listDir("/",0);
-  Serial.println("End doFS");
+  JsonObject fsInfoJson = doc.createNestedObject("fsInfo");
+  fsInfoJson["totalBytes"] = String(fs_info.totalBytes);
+  fsInfoJson["usedBytes"] = String(fs_info.usedBytes);
+
+  JsonObject root = doc.createNestedObject("root");
+  JsonArray entries = root.createNestedArray("entries");
+
+  listDir("/", entries);
+
+  String status;
+  serializeJson(doc, status);
+  return status;
 }
 
-void listDir(String path, int indent) {
-  Dir dir = fileSystem->openDir(path);
-  while (dir.next()) {
-    char fileType;
-    Serial.printf("%*s", indent, "");
-    
-    if(dir.isDirectory()) {
-      fileType = 'D';
-    }
-    if(dir.isFile()) {
-      fileType = 'F';
-    }   
-    
-    Serial.printf("%c - %s %u\n", fileType, dir.fileName().c_str(), dir.fileSize());
+void readSchedule() {
+  File scheduleFileJson = fileSystem->open(scheduleFile, "r");
 
+  DeserializationError error = deserializeJson(schedule, scheduleFileJson);
+  scheduleFileJson.close();
+
+  if (error) {
+    Serial.print(F("deserializeJson() failed: "));
+    Serial.println(error.f_str());
+  } else {
+    Serial.println("JSON parsed successfully:");
+    // Print the content to the Serial port (pretty printed)
+    serializeJsonPretty(schedule, Serial); 
+  }
+}
+
+void listDir(String path, JsonArray entries) {
+  Dir dir = fileSystem->openDir(path);
+  while (dir.next()) {   
+    JsonObject entry = entries.createNestedObject(); 
+    entry["name"] = String(dir.fileName());
+    entry["type"] = dir.isDirectory() ? String("Directory") : String("File");
+    if(dir.isFile()) {
+      entry["size"] = String(dir.fileSize());
+    }
     if(dir.isDirectory()) {
-      listDir(dir.fileName(),indent+2);
+      String subpath = path + dir.fileName() + String('/');    
+      JsonArray entries = entry.createNestedArray("entries");
+      listDir(subpath,entries);
     }
   }
 }
@@ -258,7 +303,7 @@ File uploadFile;
 void handleFileUpload() {
   HTTPUpload& upload = server.upload();
   if (upload.status == UPLOAD_FILE_START) {
-    String filename = deploymentFilename(upload.filename);
+    String filename = deploymentFilename(server.uri() + String('/') + upload.filename);
     Serial.print("Handle File Upload: ");
     Serial.println(filename);
      uploadFile = fileSystem->open(filename, "w"); 
@@ -274,6 +319,35 @@ void handleFileUpload() {
     } else {
       server.send(500, "text/plain", "Failed to create file");
     }
+  }
+}
+
+void ensureSchedule(String scheduleFile) {
+  if(!fileSystem->exists(scheduleFile)) {
+    Serial.print(scheduleFile);
+    Serial.println(" does not exist, creating.");
+    DynamicJsonDocument doc(256);
+    JsonObject open = doc.createNestedObject("open"); 
+    open["Default"] = DEFAULT_OPEN_HOUR*100;
+    open["Sun"] =  (char*)0;
+    open["Mon"] =  (char*)0;
+    open["Tue"] =  (char*)0;
+    open["Wed"] =  (char*)0;
+    open["Thu"] =  (char*)0;
+    open["Fri"] =  (char*)0;
+    open["Sat"] =  (char*)0;
+    JsonObject close = doc.createNestedObject("close"); 
+    close["Default"] = DEFAULT_CLOSE_HOUR*100;
+    close["Sun"] =  (char*)0;
+    close["Mon"] =  (char*)0;
+    close["Tue"] =  (char*)0;
+    close["Wed"] =  (char*)0;
+    close["Thu"] =  (char*)0;
+    close["Fri"] =  (char*)0;
+    close["Sat"] =  (char*)0;
+    File scheduleFileHandle = fileSystem->open(scheduleFile, "w"); 
+    serializeJson(doc, scheduleFileHandle);
+    scheduleFileHandle.close();
   }
 }
 

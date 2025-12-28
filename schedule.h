@@ -1,3 +1,2 @@
-#define TIME_OFFSET_HOURS -6
-#define CLOSE_HOUR 22
-#define OPEN_HOUR 8
+#define DEFAULT_CLOSE_HOUR 20
+#define DEFAULT_OPEN_HOUR 8
