@@ -2,7 +2,8 @@
 #include <ESP8266WebServer.h>
 #include <Esp.h>
 #include <Servo.h>
-
+#include <AceWire.h> // TwoWireInterface
+#include <Wire.h> // TwoWire, Wire
 #include <AceTime.h>
 #include <AceTimeClock.h>
 
@@ -19,12 +20,19 @@
 using namespace ace_time;
 using namespace ace_time::clock;
 
-using ace_time::DateStrings;
+using ace_time::clock::SystemClockLoop;
 using ace_time::clock::NtpClock;
+using ace_time::clock::DS3231Clock;
+using ace_time::DateStrings;
 using ace_time::zonedbx2025::kZoneAmerica_Chicago;
+using WireInterface = ace_wire::TwoWireInterface<TwoWire>;
+
+WireInterface wireInterface(Wire);
+DS3231Clock<WireInterface> dsClock(wireInterface);
+NtpClock ntpClock;
+SystemClockLoop systemClock(&ntpClock /*reference*/, &dsClock /*backup*/);
 
 static BasicZoneProcessor chicagoProcessor;
-static NtpClock ntpClock;
 
 ESP8266WebServer server(80);
 Servo servo;
@@ -46,14 +54,14 @@ void setup() {
   delay(500);
   Serial.println();
   
-  servoMove(MIDDLE_ANGLE);
-
+  Wire.begin();
+  wireInterface.begin();
+  dsClock.setup();
   connectToWifi();
-  ntpClock.setup(); 
-  if (!ntpClock.isSetup()) {
-    Serial.println(F("Something went wrong."));
-    return;
-  }
+  ntpClock.setup();
+  systemClock.setup();
+
+  servoMove(MIDDLE_ANGLE);
 
   fileSystemConfig.setAutoFormat(false);
   fileSystem->setConfig(fileSystemConfig);
@@ -103,15 +111,12 @@ int getScheduleTime(String direction, String day) {
 }
 
 void loop() {
-  acetime_t nowSeconds = ntpClock.getNow();
+  systemClock.loop();
+ 
+  acetime_t nowSeconds = systemClock.getNow();
 
   TimeZone tz = TimeZone::forZoneInfo(&kZoneAmerica_Chicago, &chicagoProcessor);
   ZonedDateTime zdt = ZonedDateTime::forEpochSeconds(nowSeconds, tz);
-  if(zdt.isError()) {
-    Serial.println("Got zdt error");
-    delay(200);
-    return;
-  }
 
   String today = DateStrings().dayOfWeekShortString(zdt.dayOfWeek());
 
@@ -133,9 +138,42 @@ void loop() {
     lastCloseDay = zdt.day();
   }
   server.handleClient();
-  delay(100);
+  delay(200);
 }
 
+void connectToWifi() {
+  Serial.println("Configuring access point...");
+  WiFi.mode(WIFI_STA);
+  delay(1000);
+  WiFi.hostname(WIFI_HOSTNAME);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  for (int i = 0; i <= 60; i++) {
+    Serial.print(".");
+    checkWifi();
+    if (haveWifi) {
+      break; 
+    }
+    delay(1000);
+  }
+  if (!haveWifi) {
+    Serial.println("Wifi not connected, rebooting.");
+    ESP.restart();
+  }
+}
+
+void checkWifi() {
+  if (WiFi.status() == WL_CONNECTED && !haveWifi) {
+    haveWifi = true;
+    Serial.println();
+    Serial.println("WiFi connected");
+    Serial.println("IP address: ");
+    Serial.println(WiFi.localIP());
+  }
+  if (WiFi.status() != WL_CONNECTED && haveWifi) {
+    haveWifi = false;
+    Serial.println("WiFi disconnected");
+  }
+}
 
 
 String doLS() {
@@ -207,33 +245,6 @@ void servoMove(int angle) {
   servo.write(angle);
   delay(500);
   servo.detach();  
-}
-
-void connectToWifi() {
-  Serial.println("Configuring access point...");
-  WiFi.mode(WIFI_STA);
-  delay(1000);
-  WiFi.hostname(WIFI_HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (!haveWifi) {
-    Serial.print(".");
-    checkWifi();
-    delay(1000);
-  }
-}
-
-void checkWifi() {
-  if (WiFi.status() == WL_CONNECTED && !haveWifi) {
-    haveWifi = true;
-    Serial.println();
-    Serial.println("WiFi connected");
-    Serial.println("IP address: ");
-    Serial.println(WiFi.localIP());
-  }
-  if (WiFi.status() != WL_CONNECTED && haveWifi) {
-    haveWifi = false;
-    Serial.println("WiFi disconnected");
-  }
 }
 
 void sendBadRequest() {
